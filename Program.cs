@@ -6,7 +6,6 @@ using System.Threading.Tasks;
 using System.IO;
 using System.Data;
 using System.Data.SqlClient;
-using System.Data.Odbc;
 using System.Net;
 using System.Net.Mail;
 using Renci.SshNet;
@@ -15,40 +14,112 @@ namespace BFS_Sell_Out_Program
 {
     class Program
     {
+        private static DataTable dtLog;      
+        private static string m_errorMessage;
+        private static int m_errorCount;    
+        private static int m_recordsSent;
+        
+        [STAThread]
         static void Main(string[] args)
         {
+            Console.WriteLine("Launching Program at " + System.DateTime.Now.ToString());
+
+            ClearErrors();
+            Init_JobActivityLog();
+            DateTime dtStart = System.DateTime.Now;
+            DateTime dtEnd;
+
+            DataRow dr = dtLog.NewRow();
+            dr["JobName"] = "BFS_SELL_OUT_PROGRAM";
+            dr["JobEvent"] = "Job Start";
+            dr["JobEventStartDateTime"] = dtStart.ToString();
+                       
             SqlConnection connection = new SqlConnection("Data Source=gbsql01v2;Initial Catalog=Dealer_Programs;Persist Security Info=True;User ID=sa;Password=4aCN4Ns");
-            OdbcConnection maddenco = new OdbcConnection("Dsn=Maddenco DTA577;uid=U577READO6;pwd=IWEXM6");
-            string logFileYear, logFileMonth, logFileDay,yesterdayDay;
+            try
+            {
+                string logFileYear, logFileMonth, logFileDay, yesterdayDay;
+                logFileYear = DateTime.Today.Year.ToString();
 
-            logFileYear = DateTime.Today.Year.ToString();
+                if (DateTime.Today.Month < 10) { logFileMonth = "0" + DateTime.Today.Month.ToString(); } else { logFileMonth = DateTime.Today.Month.ToString(); }
+                if (DateTime.Today.Day < 10) { logFileDay = "0" + DateTime.Today.Day.ToString(); } else { logFileDay = DateTime.Today.Day.ToString(); }
+                if (DateTime.Today.AddDays(-1).Day < 10) { yesterdayDay = "0" + DateTime.Today.AddDays(-1).Day.ToString(); } else { yesterdayDay = DateTime.Today.AddDays(-1).Day.ToString(); }
 
-            if (DateTime.Today.Month < 10) { logFileMonth = "0" + DateTime.Today.Month.ToString(); } else { logFileMonth = DateTime.Today.Month.ToString(); }
-            if (DateTime.Today.Day < 10) { logFileDay = "0" + DateTime.Today.Day.ToString(); } else { logFileDay = DateTime.Today.Day.ToString(); }
-            if (DateTime.Today.AddDays(-1).Day < 10) { yesterdayDay = "0" + DateTime.Today.AddDays(-1).Day.ToString(); } else { yesterdayDay = DateTime.Today.AddDays(-1).Day.ToString(); }
+                Download_Purchases_Receipt(connection, logFileYear, logFileMonth, yesterdayDay);
+                WriteDataFile(connection.ConnectionString, logFileYear, logFileMonth, logFileDay);
+            }
+            catch (Exception ex)
+            { SetError(ex.Message); }
+            finally
+            {
+                dtEnd = System.DateTime.Now;
+                TimeSpan intvl = dtEnd - dtStart;
+                Console.WriteLine("All Tasks Completed. Writing To Job Log");
 
-            Download_Purchases_Receipt(connection, logFileYear, logFileMonth, yesterdayDay);
-            WriteDatafile(maddenco, logFileYear, logFileMonth, logFileDay);
-            //Console.Read();
-            System.Environment.Exit(1);
+                dr["JobEventCompletedDateTime"] = dtEnd.ToString();
+
+                if (m_errorCount > 0)
+                    dr["JobEventResults"] = "Errors have occured. See log file for details.";
+                else
+                    dr["JobEventResults"] = m_recordsSent.ToString() + " Rows sent with no errors";
+
+                dr["JobEventErrorsCount"] = m_errorCount.ToString();
+                dtLog.Rows.Add(dr);
+                UpdateJobLog(connection);
+
+                if (m_errorCount > 0)
+                    WriteJobActivitTextFileLog();
+
+                Console.WriteLine("Job Completed With " + m_errorCount.ToString() + " Errors at " + System.DateTime.Now.ToString());
+                Console.WriteLine(intvl.Minutes.ToString() + " Minutes, " + intvl.Seconds.ToString() + " Seconds Total Run Time.");
+                //Console.WriteLine("\r\nPress Any Key...");
+                //Console.ReadKey();
+                System.Environment.Exit(1);
+            }            
         }
-        private static void Email_Notification(string emailFrom, string emailSubject, string msg)
+
+        private static void UpdateJobLog(SqlConnection objConn)
         {
-            MailMessage Notification = new MailMessage();
-            SmtpClient client = new SmtpClient();
-            client.Port = 25;
-            client.Host = "mail.pompstire.com";
-            client.Timeout = 100000;
-            client.DeliveryMethod = SmtpDeliveryMethod.Network;
-            client.UseDefaultCredentials = false;
-            client.Credentials = new System.Net.NetworkCredential("anonymous", "");
-            Notification.From = new MailAddress(emailFrom);
-            Notification.To.Add(new MailAddress("dbarrett@pompstire.com"));
-            //Notification.CC.Add(new MailAddress("dbarrett@pompstire.com"));
-            Notification.Subject = emailSubject;
-            Notification.IsBodyHtml = true;
-            Notification.Body = msg;
-            client.Send(Notification);
+            String sql1 = "EXEC Dealer_Programs.dbo.up_DealerPrograms_JobsActivityLog_Update ";
+            SqlCommand objComm = new SqlCommand();
+            objComm.Connection = objConn;
+            StringBuilder sbSql2 = new StringBuilder();
+            objConn.Open();
+            try
+            {
+                foreach (DataRow dr in dtLog.Rows)
+                {
+                    sbSql2.Clear();
+                    sbSql2.Append("@PKID = 0,");
+                    sbSql2.Append("@JobName = '" + dr["JobName"].ToString() + "', ");
+                    sbSql2.Append("@JobEvent = '" + dr["JobEvent"].ToString() + "', ");
+                    sbSql2.Append("@JobEventStartDateTime = '" + dr["JobEventStartDateTime"].ToString() + "', ");
+                    sbSql2.Append("@JobEventCompletedDateTime = '" + dr["JobEventCompletedDateTime"].ToString() + "', ");
+                    sbSql2.Append("@JobEventResults = '" + dr["JobEventResults"].ToString() + "', ");
+                    sbSql2.Append("@JobEventErrorsCount = " + dr["JobEventErrorsCount"].ToString());
+                    objComm.CommandText = sql1 + sbSql2.ToString();
+                    objComm.ExecuteNonQuery();
+                }
+            }
+            catch(Exception ex)
+            {
+                SetError(ex.Message);
+            }
+            finally
+            {
+                objConn.Close();
+            }
+        }
+
+        private static void WriteJobActivitTextFileLog()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("Errors Occured In BFS_Sell_Out_Program. \r\n");
+            sb.Append(System.DateTime.Now.ToString() + "\r\n");
+            sb.Append("-----------------------------------------\r\n");
+            using (StreamWriter sw = File.CreateText(@"BFS_Sell_Out_Program_ErrorLog.txt"))
+            {
+                sw.Write(sb.ToString() + m_errorMessage);                
+            }                
         }
 
         private static void Download_Purchases_Receipt(SqlConnection connection, string logFileYear, string logFileMonth, string logFileDay)
@@ -56,48 +127,32 @@ namespace BFS_Sell_Out_Program
             string filePath, downloadFileName, host, username, password, workingdirectory;
             try
             {
-                filePath = @"C:\\Scheduled Tasks\\BFS_Sell_Out_Report\\Documents\\";
-                DirectoryInfo di = new DirectoryInfo(filePath);
-                //DeleteFiles(di);
+                filePath = @"C:\Scheduled Tasks\BFS_Sell_Out_Report\Documents\";
+                //filePath = @"C:\Temp\BFS\";
 
+                DirectoryInfo di = new DirectoryInfo(filePath);
+  
                 downloadFileName = "ack_309354_" + logFileYear + logFileMonth + logFileDay + ".csv";
-                Console.WriteLine(downloadFileName);
+                Console.WriteLine("Downloading " + downloadFileName);
                 host = "data.shift365.com";
                 username = "309354mc";
                 password = "EqG%-$rfP-15Yt";
                 workingdirectory = "/outbound/";
 
                 using (var client = new SftpClient(host, 22, username, password))
-
                 {
-
-                    client.Connect();
-
-                    Console.WriteLine("Connected to {0}", host);
-
-                    client.ChangeDirectory(workingdirectory);
-                    Console.WriteLine("Changed directory to {0}", workingdirectory);
-
-                    //using (Stream fileStream = File.Create(@"C:\\Bridgestone\\test\\" + downloadFileName))
-                    //{
-                    //client.DownloadFile(downloadFileName, fileStream);
-                    //}
-
+                    client.Connect();                    
+                    client.ChangeDirectory(workingdirectory);                    
                     using (var file = File.OpenWrite(filePath + downloadFileName))
                     {
                         client.DownloadFile(downloadFileName, file);
                     }
-
                     client.Disconnect();
                 }
-
-                //Upload_Receipt_File(connection, filePath, downloadFileName);
-                Console.WriteLine("BFS Sell Out Report acknowledgment file has been downloaded.");
             }
             catch (Exception error)
             {
-                string msg = "GBSQL01v2\nWhile Downloading BFS Sell Out Purchases Receipt\n" + error.Message;
-                Email_Notification("BFS_Sell_Out@pompstire.com", "BFS Sell Out Upload Error", msg);
+                SetError("Download_Purchases_Reciept: " + error.Message);
             }
         }
 
@@ -107,91 +162,97 @@ namespace BFS_Sell_Out_Program
             host = "data.shift365.com";
             username = "309354mc";
             password = "EqG%-$rfP-15Yt";
+            Console.WriteLine("Uploading Data File");
             try
             {
                 using (var client = new SftpClient(host, 22, username, password))
                 {
-
                     client.Connect();
-
                     client.ChangeDirectory("/inbound/");
-
                     using (var fileStream = new FileStream(logFileName, FileMode.Open))
                     {
-
                         client.BufferSize = 4 * 1024;
-
                         client.UploadFile(fileStream, Path.GetFileName(logFileName));
-
                     }
-
-                    client.Disconnect();
-                    Console.WriteLine("BFS Tier Purchases has been uploaded to BFS sftp");
+                    client.Disconnect();                    
                 }
             }
             catch (Exception ex)
             {
-                string msg = "GBSQL01v2\nBFS Sell Out SFTP Upload Error\n" + ex.Message;
-                Email_Notification("BFS_Sell_Out@pompstire.com", "BFS_Sell_Out Notification: Error", msg);
+                SetError("Upload Data File: " + ex.Message);                         
             }
-
         }
 
-        private static void WriteDatafile(OdbcConnection cn, string logFileYear, string logFileMonth, string logFileDay)
+        private static void WriteDataFile(string sqlConnString, string logFileYear, string logFileMonth, string logFileDay)
         {
-            string dataLine, myQuery, logFileName;
-
-            myQuery = @"select tihhclscst as Customer_Class,To_Date(tihhdteinv,'YYYYMMDD') as Invoice_Date,pdmfgprdno as Manufacturer_Product_Number
-,cast(tihlqty as integer) as Quantity,tihhnuminv as Invoice_Number,sxcvstrcv as BSF_Location
-from dta577.tmihsh inner join dta577.tmihsl on tihhnuminv = tihlnuminv inner join dta577.tmsxcv
-on tihhnumstr = sxcvstrmc inner join dta577.tmprod on tihlnumstr = pdstore and tihlprd = pdnumber
-where Year(To_Date(tihhdteinv,'YYYYMMDD')) = ?
-and Month(To_Date(tihhdteinv,'YYYYMMDD')) = ?
-and tihhclscst <> 'I' and tihhvoidyn <> 'Y' and tihlclsprd in('04','08') and tihlvndprd in('010','011','013') and tihlcoddel <> 'D'
-and tihlprd not like('%GOV%') and sxcvnumvnd = '0031370'";
+            string logFileName;
+            string sql = "EXEC Dealer_Programs.dbo.up_BFS_Sellout_Program_v2";
+            StringBuilder sb = new StringBuilder("");
 
             logFileName = "C:\\Scheduled Tasks\\BFS_Sell_Out_Report\\Documents\\309354_" + logFileYear + logFileMonth + logFileDay + ".csv";
-            //logFileName = "C:\\Scheduled Tasks\\BFS_Sell_Out_Report\\Documents\\309354_20190831.csv";
-            StreamWriter outputFile;
-            outputFile = File.CreateText(logFileName);
+            //logFileName = @"C:\temp\BFS\309354_" + logFileYear + logFileMonth + logFileDay + ".csv";
+            DataTable dt = new DataTable();
 
-            cn.Open();
-            OdbcCommand cmd = new OdbcCommand(myQuery, cn);
-            cmd.Parameters.Add("Parameter1", OdbcType.Text).Value = DateTime.Today.AddDays(-1).Year.ToString();
-            cmd.Parameters.Add("Parameter2", OdbcType.Text).Value = DateTime.Today.AddDays(-1).Month.ToString();
+            Console.WriteLine("Generating Report Data");
             try
             {
-                string invDate;
-                using (OdbcDataReader dataReader = cmd.ExecuteReader())
-                {
-                    while (dataReader.Read())
-                    {
-                        DateTime invoiceDate = Convert.ToDateTime(dataReader["Invoice_Date"].ToString());
-                        invDate = invoiceDate.ToShortDateString();
-
-                        dataLine = invDate + ",";
-                        dataLine = dataLine + dataReader["Manufacturer_Product_Number"].ToString() + ",";
-                        dataLine = dataLine + dataReader["Quantity"].ToString() + ",";
-                        dataLine = dataLine + dataReader["Invoice_Number"].ToString() + ",";
-                        dataLine = dataLine + dataReader["BSF_Location"].ToString();
-                        //dataLine = dataReader["Customer_Class"].ToString() + ",";
-
-                        outputFile.WriteLine(dataLine);
-                        Console.Write(dataLine);
-
-                    }
-                    cn.Close();
-                    outputFile.Close();
-                    Upload_BFS_Sell_Out_File(logFileName);
-                }
+                SqlDataAdapter da = new SqlDataAdapter(sql, sqlConnString);
+                da.SelectCommand.CommandTimeout = 100000;                
+                da.Fill(dt);
             }
-            catch (Exception ex)
+            catch(Exception ex)
+            { SetError(ex.Message); }
+
+            Console.WriteLine("Writing Data To File");
+            StreamWriter outputFile;
+            outputFile = File.CreateText(logFileName);
+            m_recordsSent = 0;
+            foreach (DataRow dr in dt.Rows)
             {
-                //throw ex;
-                string msg = "GBSQL01v2\nDealer_Programs.dbo.sp_BFS_Sell_Out_Program\n" + ex.Message;
-                Email_Notification("GBSQL01v2@pompstire.com", "BFS Sell Out Upload Error", msg);
-            }
+                sb.Clear();
+                try
+                {
+                    sb.Append(DateTime.Parse(dr["Invoice_Date"].ToString()).ToShortDateString() + ",");
+                    sb.Append(dr["Manufacturer_Product_Number"].ToString().Trim() + ",");
+                    sb.Append(dr["Quantity"].ToString().Trim() + ",");
+                    sb.Append(dr["Invoice_Number"].ToString().Trim() + ",");
+                    sb.Append(dr["BSF_Location"].ToString().Trim());
+                    outputFile.WriteLine(sb.ToString());
+                    m_recordsSent++;
+                }
+                catch(Exception ex)
+                { SetError(ex.Message); }
+            }            
+            outputFile.Close();
+            Upload_BFS_Sell_Out_File(logFileName);
+        }
 
+        private static void Init_JobActivityLog()
+        {
+            dtLog = new DataTable();
+            DataColumn[] dc = new DataColumn[6];
+            dc[0] = new DataColumn("JobName");
+            dc[1] = new DataColumn("JobEvent");
+            dc[2] = new DataColumn("JobEventStartDateTime");
+            dc[3] = new DataColumn("JobEventCompletedDateTime");
+            dc[4] = new DataColumn("JobEventResults");
+            dc[5] = new DataColumn("JobEventErrorsCount");
+            dtLog.Columns.AddRange(dc);
+        }
+
+        private static void ClearErrors()
+        {    
+            m_errorMessage = "";
+            m_errorCount = 0;
+        }
+
+        private static void SetError(string msg)
+        {
+            if (m_errorMessage.Length > 0)
+                m_errorMessage += "\r\n";
+
+            m_errorMessage += msg;
+            m_errorCount++;
         }
     }
 }
